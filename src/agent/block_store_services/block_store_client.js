@@ -15,6 +15,7 @@ const config = require('../../../config');
 const { RPC_BUFFERS, RpcError } = require('../../rpc');
 const { get_block_internal_dir } = require('../../agent/block_store_services/block_store_base');
 const util = require('util');
+const cloud_utils = require('../../util/cloud_utils');
 
 
 const block_store_info_cache = new LRUCache({
@@ -293,12 +294,19 @@ class BlockStoreClient {
                     Key: `${bs_info.blocks_path}/${block_dir}/${block_id}`,
                     Metadata: disable_metadata ? undefined : { noobaablockmd: encoded_md },
                 };
-                dbg.log1('got s3_params from block_store. writing using S3 sdk. s3_params =',
-                    _.omit(s3_params, 'secretAccessKey'));
                 s3_params.httpOptions = {
                     agent: http_utils.get_unsecured_agent(s3_params.endpoint)
                 };
-                const s3 = new AWS.S3(s3_params);
+                let s3;
+                if (bs_info.aws_sts_arn) {
+                    const stsClientParams = this._create_sts_s3_client_params(bs_info, s3_params);
+                    s3 = await cloud_utils.createSTSS3Client(stsClientParams.sts_params, stsClientParams.additionalParams);
+                    dbg.log1('got sts_params from block_store. writing using S3 sdk. sts_params =', stsClientParams);
+                } else {
+                    dbg.log1('got s3_params from block_store. writing using S3 sdk. s3_params =',
+                    _.omit(s3_params, 'secretAccessKey'));
+                    s3 = new AWS.S3(s3_params);
+                }
                 write_params.Body = data;
                 await s3.putObject(write_params).promise();
                 const data_length = data.length;
@@ -338,13 +346,19 @@ class BlockStoreClient {
                     Key: `${bs_info.blocks_path}/${block_dir}/${block_id}`
                 };
                 const disable_metadata = bs_info.disable_metadata;
-                dbg.log1('got s3_params from block_store. reading using S3 sdk. s3_params =',
-                    _.omit(s3_params, 'secretAccessKey'));
-
                 s3_params.httpOptions = {
                     agent: http_utils.get_unsecured_agent(s3_params.endpoint)
                 };
-                const s3 = new AWS.S3(s3_params);
+                let s3;
+                if (bs_info.aws_sts_arn) {
+                    const stsClientParams = this._create_sts_s3_client_params(bs_info, s3_params);
+                    s3 = await cloud_utils.createSTSS3Client(stsClientParams.sts_params, stsClientParams.additionalParams);
+                    dbg.log1('got sts_params from block_store. writing using S3 sdk. sts_params =', stsClientParams);
+                } else {
+                    dbg.log1('got s3_params from block_store. writing using S3 sdk. s3_params =',
+                    _.omit(s3_params, 'secretAccessKey'));
+                    s3 = new AWS.S3(s3_params);
+                }
 
                 const data = await s3.getObject(read_params).promise();
                 const noobaablockmd = data.Metadata.noobaablockmd || data.Metadata.noobaa_block_md;
@@ -395,6 +409,21 @@ class BlockStoreClient {
         } else {
             throw new Error('_update_usage_stats should except READ or WRITE only');
         }
+    }
+
+    _create_sts_s3_client_params(bs_info, s3_params) {
+        const sts_params = {
+            aws_sts_arn: bs_info.aws_sts_arn,
+        };
+        const additionalParams = {
+            RoleSessionName: '_delegate_write_block_s3_session',
+            endpoint: bs_info.endpoint,
+            signatureVersion: bs_info.signatureVersion,
+            s3DisableBodySigning: bs_info.s3DisableBodySigning,
+            httpOptions: s3_params.httpOptions,
+            s3ForcePathStyle: s3_params.s3ForcePathStyle
+        };
+        return {sts_params, additionalParams};
     }
 
     async send_usage_stats() {

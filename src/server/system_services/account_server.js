@@ -27,7 +27,7 @@ const pool_server = require('../system_services/pool_server');
 const azure_storage = require('../../util/new_azure_storage_wrap');
 const NetStorage = require('../../util/NetStorageKit-Node-master/lib/netstorage');
 const usage_aggregator = require('../bg_services/usage_aggregator');
-
+const fs = require('fs');
 
 const demo_access_keys = Object.freeze({
     access_key: new SensitiveString('123'),
@@ -791,7 +791,7 @@ async function add_external_connection(req) {
         throw new RpcError(res.error.code, res.error.message);
     }
 
-    var info = _.pick(req.rpc_params, 'name', 'endpoint', 'endpoint_type');
+    var info = _.pick(req.rpc_params, 'name', 'endpoint', 'endpoint_type', 'aws_sts_arn');
     if (!info.endpoint_type) info.endpoint_type = 'AWS';
     info.access_key = req.rpc_params.identity;
     info.secret_key = system_store.master_key_manager.encrypt_sensitive_string_with_master_key_id(
@@ -950,7 +950,9 @@ async function _check_external_connection_internal(connection) {
         case 'AZURE': {
             return check_azure_connection(connection);
         }
-
+        case 'AWSSTS': {
+            return check_aws_sts_connection(connection);
+        }
         case 'AWS':
         case 'S3_COMPATIBLE':
         case 'FLASHBLADE':
@@ -1085,8 +1087,42 @@ async function check_google_connection(params) {
     }
 }
 
+async function check_aws_sts_connection(params) {
+    if (!params.endpoint.startsWith('http://') && !params.endpoint.startsWith('https://')) {
+        params.endpoint = 'http://' + params.endpoint;
+    }
+    const timeoutError = Object.assign(
+        new Error('Operation timeout'), { code: 'OperationTimeout' }
+    );
 
+    try {
+        const additionalParams = {
+            RoleSessionName: "check_aws_sts_sessions",
+            endpoint: params.endpoint,
+            signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(params.endpoint, params.auth_method),
+            s3DisableBodySigning: cloud_utils.disable_s3_compatible_bodysigning(params.endpoint),
+            httpOptions: {
+                agent: http_utils.get_unsecured_agent(params.endpoint)
+            }
+        };
+        const s3 = await cloud_utils.createSTSS3Client(params, additionalParams);
+        await P.timeout(check_connection_timeout, s3.listBuckets().promise(), () => timeoutError);
+        return { status: 'SUCCESS' };
+    } catch (err) {
+        dbg.warn(`got error on listBuckets with params`, _.omit(params, 'secret'),
+            ` error: ${err}, code: ${err.code}, message: ${err.message}`
+        );
+        const status = aws_error_mapping[err.code] || 'UNKNOWN_FAILURE';
+        return {
+            status,
+            error: {
+                code: err.code,
+                message: err.message || 'Unknown Error'
+            }
+        };
+    }
 
+}
 async function check_aws_connection(params) {
     if (!params.endpoint.startsWith('http://') && !params.endpoint.startsWith('https://')) {
         params.endpoint = 'http://' + params.endpoint;

@@ -1083,9 +1083,9 @@ function get_bucket_lifecycle_configuration_rules(req) {
  * GET_CLOUD_BUCKETS
  *
  */
-function get_cloud_buckets(req) {
+ function get_cloud_buckets(req) {
     dbg.log0('get cloud buckets', req.rpc_params);
-    return P.fcall(function() {
+    return P.fcall(async function() {
             var connection = cloud_utils.find_cloud_connection(
                 req.account,
                 req.rpc_params.connection
@@ -1142,7 +1142,23 @@ function get_cloud_buckets(req) {
                 return storage.getBuckets()
                     .then(data => data[0].map(bucket =>
                         _inject_usage_to_cloud_bucket(bucket.name, connection.endpoint, used_cloud_buckets)));
-            } else { //else if AWS
+            } else if (connection.endpoint_type === 'AWSSTS') {
+               const additionalParams = {
+                RoleSessionName: "get_cloud_buckets_session",
+                signatureVersion: cloud_utils.get_s3_endpoint_signature_ver(connection.endpoint, connection.auth_method),
+                s3DisableBodySigning: cloud_utils.disable_s3_compatible_bodysigning(connection.endpoint),
+                httpOptions: {
+                    agent: http_utils.get_unsecured_agent(connection.endpoint)
+                }
+               };
+               const s3 = await cloud_utils.createSTSS3Client(connection, additionalParams);
+               const used_cloud_buckets = cloud_utils.get_used_cloud_targets(['AWS', 'S3_COMPATIBLE', 'FLASHBLADE', 'IBM_COS'],
+                    system_store.data.buckets, system_store.data.pools, system_store.data.namespace_resources);
+               return P.timeout(EXTERNAL_BUCKET_LIST_TO, P.ninvoke(s3, 'listBuckets'))
+                    .then(data => data.Buckets.map(bucket =>
+                        _inject_usage_to_cloud_bucket(bucket.Name, connection.endpoint, used_cloud_buckets)
+                    ));
+             } else { //else if AWS
                 var s3 = new AWS.S3({
                     endpoint: connection.endpoint,
                     accessKeyId: connection.access_key.unwrap(),
